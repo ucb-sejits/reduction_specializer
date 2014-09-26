@@ -3,13 +3,14 @@ specializer slim
 """
 
 import numpy as np
-from ctree.jit import LazySpecializedFunction
+from ctree.jit import LazySpecializedFunction, ConcreteSpecializedFunction
 from ctree.frontend import get_ast
 from ctree import browser_show_ast
 from ctree.transformations import PyBasicConversions
 from ctree.nodes import CtreeNode
 from ctree.c.nodes import For, SymbolRef, Assign, Lt, PostInc, \
-    Constant
+    Constant, Deref
+import ctree.np
 import ctypes as ct
 
 import ast
@@ -47,6 +48,22 @@ class SlimFrontEnd(PyBasicConversions):
 class SlimCBackend(ast.NodeTransformer):
     def __init__(self, arg_cfg):
         self.arg_cfg = arg_cfg
+        self.retval = None
+
+    def visit_FunctionDecl(self, node):
+        arg_type = np.ctypeslib.ndpointer(self.arg_cfg[0],
+                                          self.arg_cfg[2],
+                                          self.arg_cfg[1])
+
+        param = node.params[1]
+        param.type = arg_type()
+        node.params = [param]
+        retval = SymbolRef("output", arg_type())
+        self.retval = "output"
+        node.params.append(retval)
+        node.defn = list(map(self.visit, node.defn))
+        node.defn[0].left.type = arg_type._dtype_.type()
+        return node
 
     def visit_PointsLoop(self, node):
         target = node.target
@@ -56,6 +73,26 @@ class SlimCBackend(ast.NodeTransformer):
             PostInc(SymbolRef(target)),
             list(map(self.visit, node.body))
         )
+
+    def visit_Return(self, node):
+        return Assign(Deref(SymbolRef(self.retval)), node.value)
+
+
+class ConcreteSlim(ConcreteSpecializedFunction):
+    def finalize(self, entry_name, tree, entry_type):
+        self._c_function = self._compile(entry_name, tree, entry_type)
+        return self
+
+    def __call__(self, input):
+        output = None
+        if input.dtype == np.float32:
+            output = ct.c_float()
+        elif input.dtype == np.int32:
+            output = ct.c_int()
+
+        self._c_function(input, ct.byref(output))
+        return output.value
+
 
 
 class Slim(LazySpecializedFunction):
@@ -70,8 +107,15 @@ class Slim(LazySpecializedFunction):
         arg_cfg, tune_cfg = program_cfg
         tree = SlimFrontEnd().visit(tree)
         tree = SlimCBackend(arg_cfg).visit(tree)
-        browser_show_ast(tree, 'tmp.png')
-        print(tree)
+        # browser_show_ast(tree, 'tmp.png')
+        fn = ConcreteSlim()
+        arg_type = np.ctypeslib.ndpointer(arg_cfg[0],
+                                          arg_cfg[2],
+                                          arg_cfg[1])
+        print(tree.files[0])
+        return fn.finalize('kernel',
+                           tree,
+                           ct.CFUNCTYPE(None, arg_type, ct.POINTER(ct.c_float)))
 
     def points(self, input):
         iter = np.nditer(input, flags=['c_index'])
@@ -79,29 +123,21 @@ class Slim(LazySpecializedFunction):
             yield iter.index
             iter.iternext()
 
-    # def __call__(self, input):
-    # 
-    #     return self.kernel(input)
-
 
 class SumReduce(Slim):
     def kernel(self, input):
-        result = 0
+        result = input[0]
         for x in self.points(input):
-            result += input[x]
+            result = max(x, result)
         return result
-
-    def kernel(self, input, result):
-        # int kernel(int* input):
-        # return result
-
-
 
 
 if __name__ == '__main__':
     special_sum = SumReduce()
-    a = np.arange(1, 1000100, 1)
+    a = (np.random.rand(1024 * 1024) * 100).astype(np.float32)
     b = special_sum(a)
+    print(b)
+    print(np.sum(a))
     assert b == sum(a), "FAILED"
     print("PASSED")
 
